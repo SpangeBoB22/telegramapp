@@ -1,0 +1,14 @@
+{
+  "1": {
+    "API_ID": "API_ID",
+    "API_HASH": "API_HASH",
+    "PHONE_NUMBER": "<<PHONE_NUMBER (optional)>>",
+    "SESSION_NAME": "main_session"
+  },
+  "2": {
+    "API_ID": "API_ID",
+    "API_HASH": "API_HASH",
+    "PHONE_NUMBER": "<<PHONE_NUMBER (optional)>>",
+    "SESSION_NAME": "additional_session"
+  }
+}

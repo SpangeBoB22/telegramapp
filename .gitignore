@@ -1,0 +1,10 @@
+.idea
+*.iml
+out
+gen
+add.env
+api_data.json
+unit_test/files
+/api_data.enc
+/sessions/
+.env
