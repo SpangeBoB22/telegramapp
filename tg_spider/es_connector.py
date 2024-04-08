@@ -1,22 +1,27 @@
 import asyncio
-import ssl
-from typing import List, Dict, Tuple, Any
+import json
 import logging
+import os
+import pathlib
+import re
+import ssl
+from asyncio import Semaphore
+from typing import List, Dict, Tuple, Any
 
+import aiofiles
 from elasticsearch import AsyncElasticsearch
-from elasticsearch.helpers import async_bulk
+from elasticsearch.helpers import async_bulk, async_scan
 
 from tg_spider import conf
-from tg_spider.models import ChannelMessage
-from tg_spider.core import  Singleton
 from tg_spider.async_logger_wrap import AsyncLogger
-
+from tg_spider.core import Singleton
+from tg_spider.models import ChannelMessage
 
 logger = AsyncLogger()
 
 INDEX_MAPPING = {
         "settings": {
-            "number_of_shards": 1,
+            "number_of_shards": 2,
             "number_of_replicas": 0
         },
         "mappings": {
@@ -100,13 +105,16 @@ class AsyncElasticsearchConnector(metaclass=Singleton):
             self.es = AsyncElasticsearch(
                 api_key=(id_, key),
                 hosts=[f'{conf.es_scheme}://{conf.es_host}:{conf.es_port}'],
-                ssl_context=ssl_context
+                ssl_context=ssl_context,
+                timeout=60
             )
         else:
             raise ValueError('No correct key for Elasticsearch connection provided.')
 
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self._ensure_index_with_mapping(self.es, conf.es_index_name))
+
+        self._semaphore = Semaphore(conf.es_n_connections)
 
     async def write_document(self, index: str, document: ChannelMessage) -> Dict | None:
         """
@@ -127,19 +135,20 @@ class AsyncElasticsearchConnector(metaclass=Singleton):
             The method constructs an Elasticsearch 'index' operation and awaits its completion.
             The caller should handle any exceptions that may arise from this operation.
         """
-        try:
-            body = document.get_body()
-            response = await self.es.update(index=index,
-                                            id=document.id_,
-                                            doc=body,
-                                            doc_as_upsert=True)
-            return response
-        except Exception as ex:
-            loop = asyncio.get_event_loop()
-            loop.create_task(logger.alog(logging.CRITICAL,
-                                         message=f'Error while writing document to ES. Document ID: {document.id_}',
-                                         ex=ex))
-            return None
+        async with self._semaphore:
+            try:
+                body = document.get_body()
+                response = await self.es.update(index=index,
+                                                id=document.id_,
+                                                doc=body,
+                                                doc_as_upsert=True)
+                return response
+            except Exception as ex:
+                loop = asyncio.get_event_loop()
+                loop.create_task(logger.alog(logging.CRITICAL,
+                                             message=f'Error while writing document to ES. Document ID: {document.id_}',
+                                             ex=ex))
+                return None
 
     async def write_batch(self, index: str, batch: List[ChannelMessage]) -> Tuple[int, int | List[Any]] | None:
         """
@@ -162,23 +171,28 @@ class AsyncElasticsearchConnector(metaclass=Singleton):
             in the batch and awaits its completion. The caller should handle any exceptions that may arise
             from this operation.
         """
-        try:
-            bulk_body = []
-            for document in batch:
-                document_body = {"_index": index,
-                                 "_id": document.id_,
-                                 "_source": document.get_body(),
-                                 "doc_as_upsert": True}
-                bulk_body.append(document_body)
+        async with self._semaphore:
+            try:
+                bulk_body = []
+                for document in batch:
+                    document_body = {"_index": index,
+                                     "_id": document.id_,
+                                     "_source": document.get_body(),
+                                     "doc_as_upsert": True}
+                    bulk_body.append(document_body)
+                loop = asyncio.get_event_loop()
 
-            response = await async_bulk(self.es, bulk_body)
-            return response
-        except Exception as ex:
-            loop = asyncio.get_event_loop()
-            loop.create_task(logger.alog(logging.CRITICAL,
-                                         message=f'Error while writing batch into ES',
-                                         ex=ex))
-            return None
+                loop.create_task(logger.alog(logging.INFO,
+                                             message=f'Documents to be indexed: {len(bulk_body)}'))
+
+                response = await async_bulk(self.es, bulk_body, chunk_size=100)
+                return response
+            except Exception as ex:
+                loop = asyncio.get_event_loop()
+                loop.create_task(logger.alog(logging.CRITICAL,
+                                             message=f'Error while writing batch into ES',
+                                             ex=ex))
+                return None
 
     async def close(self):
         """
@@ -228,6 +242,49 @@ class AsyncElasticsearchConnector(metaclass=Singleton):
             await es.indices.create(index=index_name, body=INDEX_MAPPING)
             loop.create_task(logger.alog(level=logging.INFO,
                                          message=f"Index {index_name} has been created."))
+
+    def save_es_index_to_files(cls, save_path: pathlib.Path):
+        # Перевірка та очищення директорії зберігання
+        if save_path.exists() and save_path.is_dir():
+            for filename in os.listdir(save_path):
+                file_path = save_path / filename
+                if file_path.is_file():
+                    os.unlink(file_path)
+        else:
+            # Створення директорії, якщо вона не існує
+            os.makedirs(save_path)
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(cls.async_save_es_index_to_files(save_path))
+
+    async def async_save_es_index_to_files(self, save_path: pathlib.Path):
+
+        # Виконання асинхронного пошуку для отримання усіх записів з індексу
+        async for hit in async_scan(client=self.es,
+                                    index=conf.es_index_name,
+                                    query={"query": {"match_all": {}}}):
+            source_value = hit.get('_source', {}).get('source', 'unknown')
+            sanitized_source_value = self._sanitize_filename(source_value)
+            file_path = save_path / f"{sanitized_source_value}.jsonl"
+
+            # Асинхронне додавання даних до файлу
+            async with aiofiles.open(file_path, 'a', encoding='utf') as file:
+                await file.write(json.dumps(hit['_source'], ensure_ascii=False) + '\n')
+
+        await self.es.close()
+
+    @staticmethod
+    def _sanitize_filename(filename):
+        """
+        Видаляє недопустимі символи з імен файлів.
+        """
+        # Замінює будь-який недопустимий символ на підкреслення
+        return re.sub(r'[\/\\:*?"<>|]', '_', filename)
 
 
 

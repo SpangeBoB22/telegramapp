@@ -84,6 +84,10 @@ class Config:
         return self.config['ES']['INDEX_NAME']
 
     @property
+    def es_n_connections(self):
+        return int(self.config['ES'].get('N_OF_CONNECTIONS', 10))
+
+    @property
     def es_port(self):
         return self.config['ES']['PORT']
 

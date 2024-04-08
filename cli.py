@@ -1,9 +1,12 @@
+import asyncio
+import pathlib
 from typing import Optional
 from pathlib import Path
 
 import click
 from tg_spider.crypto_util import JsonEncryptor
 from tg_spider.telethone_wrapper import TelegramWorker
+from tg_spider.es_connector import AsyncElasticsearchConnector
 
 
 @click.group()
@@ -74,6 +77,24 @@ def start_single_reader(worker_id: int, password: str):
         password (str): Password for decrypting the credentials.
     """
     TelegramWorker.start_reading_channels(worker_id, password)
+
+
+@cli.command()
+@click.option('--output_path', '-o',
+              type=click.Path(exists=False, file_okay=False, dir_okay=True, writable=True),
+              help='Path to output dir')
+def dump_index(output_path: str):
+    """
+    Dumps the index with messages into the given folder
+
+    Args:
+        output_path (str): The path to the output dir.
+    """
+
+    # Перетворення шляху в об'єкт Path, якщо output_path не None
+    output_path = pathlib.Path(output_path) if output_path else None
+
+    AsyncElasticsearchConnector().save_es_index_to_files(output_path)
 
 
 if __name__ == '__main__':

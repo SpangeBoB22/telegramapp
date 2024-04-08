@@ -8,3 +8,4 @@ unit_test/files
 /api_data.enc
 /sessions/
 .env
+/pars_config.json
