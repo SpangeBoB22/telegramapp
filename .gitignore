@@ -9,3 +9,4 @@ unit_test/files
 /sessions/
 .env
 /pars_config.json
+venv
